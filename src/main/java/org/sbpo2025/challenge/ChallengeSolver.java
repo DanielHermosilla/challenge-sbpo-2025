@@ -1,176 +1,155 @@
-// Column Generation using Lagrangian Guidance - SBPO 2025
-// Autor: ChatGPT para Daniel Hermosilla
-// Este código implementa un método de generación de columnas heurística con guía dual (lagrangiana),
-// construyendo subwaves iterativamente que maximizan el costo reducido con base en multiplicadores lambda.
-
 package org.sbpo2025.challenge;
 
+import com.google.ortools.Loader;
+import com.google.ortools.linearsolver.*;  // OR-Tools MPSolver, MPVariable, etc.
 import org.apache.commons.lang3.time.StopWatch;
 
 import java.util.*;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 
 public class ChallengeSolver {
-    private final long MAX_RUNTIME = 600000;
-    protected List<Map<Integer, Integer>> orders;
-    protected List<Map<Integer, Integer>> aisles;
-    protected int nItems;
-    protected int waveSizeLB;
-    protected int waveSizeUB;
+  static {
+    // load OR-Tools native libraries
+    Loader.loadNativeLibraries();
+  }
 
-    public ChallengeSolver(List<Map<Integer, Integer>> orders, List<Map<Integer, Integer>> aisles, int nItems, int waveSizeLB, int waveSizeUB) {
-        this.orders = orders;
-        this.aisles = aisles;
-        this.nItems = nItems;
-        this.waveSizeLB = waveSizeLB;
-        this.waveSizeUB = waveSizeUB;
+  private final long MAX_RUNTIME = 600_000; // 10 minutes in ms
+  protected List<Map<Integer, Integer>> orders; // orders[o][i] = u_{oi}
+  protected List<Map<Integer, Integer>> aisles; // aisles[a][i] = u_{ai}
+  protected int nItems;
+  protected int waveSizeLB, waveSizeUB;
+
+  public ChallengeSolver(
+      List<Map<Integer, Integer>> orders,
+      List<Map<Integer, Integer>> aisles,
+      int nItems,
+      int waveSizeLB,
+      int waveSizeUB) {
+    this.orders = orders;
+    this.aisles = aisles;
+    this.nItems = nItems;
+    this.waveSizeLB = waveSizeLB;
+    this.waveSizeUB = waveSizeUB;
+  }
+
+  @SuppressWarnings("ConstantConditions")
+  public ChallengeSolution solve(StopWatch stopWatch) {
+
+    int m = aisles.size();
+    int maxK = Math.min(m, 10); // only explore up to 5 aisles
+    
+    double bestRatio = Double.NEGATIVE_INFINITY;
+    Set<Integer> bestOrders = Collections.emptySet();
+    Set<Integer> bestAisles = Collections.emptySet();
+
+    // Precompute for each order its total size sum_i u_{oi}
+    int[] orderSizes = new int[orders.size()];
+    for (int o = 0; o < orders.size(); o++) {
+      int sum = 0;
+      for (int qty : orders.get(o).values()) sum += qty;
+      orderSizes[o] = sum;
     }
 
-    public ChallengeSolution solve(StopWatch stopWatch) {
-        double[] lambda = new double[nItems];
-        Arrays.fill(lambda, 0.0);
+    // Precompute each aisle's total capacity sum_i u_{ai}
+    double[] aisleTotals = new double[m];
+    for (int a = 0; a < m; a++) {
+      int sum = 0;
+      for (int qty : aisles.get(a).values()) sum += qty;
+      aisleTotals[a] = sum;
+    }
 
-        ChallengeSolution bestSolution = null;
-        double bestZ = -1;
+    // Try every k = 1..maxK
+    for (int k = 1; k <= maxK; k++) {
+      // time check
+      long remaining = TimeUnit.MILLISECONDS.toMillis(MAX_RUNTIME) - stopWatch.getTime(TimeUnit.MILLISECONDS);
+      if (remaining <= 0) break;
 
-        for (int iter = 0; iter < 30 && getRemainingTime(stopWatch) > 1; iter++) {
-            Subwave column = generateColumn(lambda);
-            ChallengeSolution candidate = new ChallengeSolution(column.orders, column.aisles);
+      // 1) pick top-k aisles by total capacity
+      Integer[] idx = new Integer[m];
+      for (int a = 0; a < m; a++) idx[a] = a;
+      Arrays.sort(idx, Comparator.comparingDouble((Integer a) -> aisleTotals[a]).reversed());
+      Set<Integer> chosenAisles = new HashSet<>();
+      for (int i = 0; i < k; i++) chosenAisles.add(idx[i]);
 
-            if (!isSolutionFeasible(candidate)) continue;
-
-            double z = computeObjectiveFunction(candidate);
-            if (z > bestZ) {
-                bestZ = z;
-                bestSolution = candidate;
-            }
-
-            // actualizar lambda (pseudo-dual update)
-            int[] picked = new int[nItems];
-            int[] available = new int[nItems];
-
-            for (int o : column.orders) {
-                for (Map.Entry<Integer, Integer> e : orders.get(o).entrySet()) {
-                    picked[e.getKey()] += e.getValue();
-                }
-            }
-            for (int a : column.aisles) {
-                for (Map.Entry<Integer, Integer> e : aisles.get(a).entrySet()) {
-                    available[e.getKey()] += e.getValue();
-                }
-            }
-
-            for (int i = 0; i < nItems; i++) {
-                double viol = picked[i] - available[i];
-                lambda[i] = Math.max(0.0, lambda[i] + 0.1 * viol); // subgradient update
-            }
+      // 2) build capacity vector v_i = sum_{a in chosen} u_{ai}
+      int[] cap = new int[nItems];
+      for (int a : chosenAisles) {
+        for (Map.Entry<Integer,Integer> e : aisles.get(a).entrySet()) {
+          cap[e.getKey()] += e.getValue();
         }
+      }
 
-        return bestSolution;
-    }
+      // 3) set up the 0–1 knapsack over orders
+      MPSolver solver = MPSolver.createSolver("SCIP");
+      if (solver == null) continue;  // solver not available
 
-    protected Subwave generateColumn(double[] lambda) {
-        List<Integer> orderIndices = IntStream.range(0, orders.size()).boxed().collect(Collectors.toList());
-        orderIndices.sort((o1, o2) -> Double.compare(-dualCost(o1, lambda), -dualCost(o2, lambda)));
+      // decision vars x_o ∈ {0,1}
+      MPVariable[] x = new MPVariable[orders.size()];
+      for (int o = 0; o < orders.size(); o++) {
+        x[o] = solver.makeBoolVar("x_"+o);
+      }
 
-        Set<Integer> selectedOrders = new HashSet<>();
-        Set<Integer> selectedAisles = new HashSet<>();
-        int[] totalPicked = new int[nItems];
+      // capacity constraints: for each item i, sum_o x_o * u_{oi} <= cap[i]
+      for (int i = 0; i < nItems; i++) {
+        MPConstraint c = solver.makeConstraint(0.0, cap[i], "item_"+i);
+        for (int o = 0; o < orders.size(); o++) {
+          int qty = orders.get(o).getOrDefault(i, 0);
+          if (qty>0) c.setCoefficient(x[o], qty);
+        }
+      }
 
-        for (int o : orderIndices) {
-            Map<Integer, Integer> itemMap = orders.get(o);
-            int[] newPicked = Arrays.copyOf(totalPicked, nItems);
+      // wave‐size constraints: LB <= sum_o x_o * orderSize_o <= UB
+      MPConstraint lb = solver.makeConstraint(waveSizeLB, Double.POSITIVE_INFINITY, "LB");
+      MPConstraint ub = solver.makeConstraint(Double.NEGATIVE_INFINITY, waveSizeUB, "UB");
+      for (int o = 0; o < orders.size(); o++) {
+        lb.setCoefficient(x[o], orderSizes[o]);
+        ub.setCoefficient(x[o], orderSizes[o]);
+      }
 
-            for (Map.Entry<Integer, Integer> e : itemMap.entrySet()) {
-                newPicked[e.getKey()] += e.getValue();
+      // objective: maximize total units = sum_o x_o * orderSize_o
+      MPObjective obj = solver.objective();
+      for (int o = 0; o < orders.size(); o++) {
+        obj.setCoefficient(x[o], orderSizes[o]);
+      }
+      obj.setMaximization();
+
+      // set a time limit so we never exceed remaining time
+            
+		// enforce a time limit (in milliseconds) on this solve
+		solver.setTimeLimit(remaining);
+
+      MPSolver.ResultStatus status = solver.solve();
+
+      if (status == MPSolver.ResultStatus.OPTIMAL ||
+          status == MPSolver.ResultStatus.FEASIBLE) {
+        // total units picked
+        double totalUnits = obj.value();
+        double ratio = totalUnits / k;
+
+        // if ratio improves, record the solution
+        if (ratio > bestRatio) {
+          bestRatio = ratio;
+          bestAisles = new HashSet<>(chosenAisles);
+          bestOrders = new HashSet<>();
+          for (int o = 0; o < orders.size(); o++) {
+            if (x[o].solutionValue() > 0.5) {
+              bestOrders.add(o);
             }
-            int total = Arrays.stream(newPicked).sum();
-            if (total > waveSizeUB) continue;
-
-            selectedOrders.add(o);
-            totalPicked = newPicked;
-
-            for (int i : itemMap.keySet()) {
-                for (int a = 0; a < aisles.size(); a++) {
-                    if (aisles.get(a).containsKey(i)) selectedAisles.add(a);
-                }
-            }
-
-            if (total >= waveSizeLB) break;
+          }
         }
-		System.out.println("Trying subwave:");
-		System.out.println("  Orders: " + selectedOrders);
-		System.out.println("  Aisles: " + selectedAisles);
-		System.out.println("  Total items: " + Arrays.stream(totalPicked).sum());
-        return new Subwave(selectedOrders, selectedAisles, Arrays.stream(totalPicked).sum());
+      }
+
+      // small interruption check
+      if (stopWatch.getTime(TimeUnit.MILLISECONDS) > MAX_RUNTIME) break;
     }
 
-    protected double dualCost(int order, double[] lambda) {
-        return orders.get(order).entrySet().stream()
-            .mapToDouble(e -> e.getValue() * (1.0 - lambda[e.getKey()]))
-            .sum();
-    }
+    // stopWatch.stop();
+    return new ChallengeSolution(bestOrders, bestAisles);
+  }
 
-    protected long getRemainingTime(StopWatch stopWatch) {
-        return Math.max(TimeUnit.SECONDS.convert(MAX_RUNTIME - stopWatch.getTime(TimeUnit.MILLISECONDS), TimeUnit.MILLISECONDS), 0);
-    }
-
-    protected boolean isSolutionFeasible(ChallengeSolution challengeSolution) {
-        Set<Integer> selectedOrders = challengeSolution.orders();
-        Set<Integer> visitedAisles = challengeSolution.aisles();
-        if (selectedOrders == null || visitedAisles == null || selectedOrders.isEmpty() || visitedAisles.isEmpty()) return false;
-
-        int[] totalUnitsPicked = new int[nItems];
-        int[] totalUnitsAvailable = new int[nItems];
-
-        for (int order : selectedOrders) {
-            for (Map.Entry<Integer, Integer> entry : orders.get(order).entrySet()) {
-                totalUnitsPicked[entry.getKey()] += entry.getValue();
-            }
-        }
-        for (int aisle : visitedAisles) {
-            for (Map.Entry<Integer, Integer> entry : aisles.get(aisle).entrySet()) {
-                totalUnitsAvailable[entry.getKey()] += entry.getValue();
-            }
-        }
-
-        int totalUnits = Arrays.stream(totalUnitsPicked).sum();
-        if (totalUnits < waveSizeLB || totalUnits > waveSizeUB) return false;
-
-        for (int i = 0; i < nItems; i++) {
-            if (totalUnitsPicked[i] > totalUnitsAvailable[i]) return false;
-        }
-
-        return true;
-    }
-
-    protected double computeObjectiveFunction(ChallengeSolution challengeSolution) {
-        Set<Integer> selectedOrders = challengeSolution.orders();
-        Set<Integer> visitedAisles = challengeSolution.aisles();
-        if (selectedOrders == null || visitedAisles == null || selectedOrders.isEmpty() || visitedAisles.isEmpty()) return 0.0;
-
-        int totalUnitsPicked = 0;
-        for (int order : selectedOrders) {
-            totalUnitsPicked += orders.get(order).values().stream().mapToInt(Integer::intValue).sum();
-        }
-        return (double) totalUnitsPicked / visitedAisles.size();
-    }
-}
-
-class Subwave {
-    public Set<Integer> orders;
-    public Set<Integer> aisles;
-    public int totalItems;
-
-    public Subwave(Set<Integer> orders, Set<Integer> aisles, int totalItems) {
-        this.orders = orders;
-        this.aisles = aisles;
-        this.totalItems = totalItems;
-    }
-
-    public String toString() {
-        return "Orders: " + orders + ", Aisles: " + aisles + ", Items: " + totalItems;
-    }
+  protected long getRemainingTime(StopWatch sw) {
+    return Math.max(
+      TimeUnit.MILLISECONDS.toMillis(MAX_RUNTIME) - sw.getTime(TimeUnit.MILLISECONDS),
+      0L);
+  }
 }
