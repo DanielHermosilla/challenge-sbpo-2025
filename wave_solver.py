@@ -13,8 +13,6 @@ def read_instance(filename):
     """
     u_oi = {}
     u_ai = {}
-    with open(filename, "r") as f:
-        # Primera línea: o, i, a
         o, num_items, a = map(int, f.readline().split())
         # Leer órdenes
         for o_idx in range(o):

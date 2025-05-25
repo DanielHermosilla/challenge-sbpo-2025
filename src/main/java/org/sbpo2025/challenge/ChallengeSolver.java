@@ -1,9 +1,22 @@
 package org.sbpo2025.challenge;
 
 import com.google.ortools.Loader;
-import com.google.ortools.linearsolver.*;  // OR-Tools MPSolver, MPVariable, etc.
-import org.apache.commons.lang3.time.StopWatch;
+// --- para tu knapsack con MPSolver ---
+import com.google.ortools.linearsolver.MPConstraint;
+import com.google.ortools.linearsolver.MPObjective;
+import com.google.ortools.linearsolver.MPSolver;
+import com.google.ortools.linearsolver.MPVariable;
 
+// --- para el CP-SAT de refinamiento ---
+import com.google.ortools.sat.LinearExprBuilder;
+import com.google.ortools.sat.CpModel;
+import com.google.ortools.sat.CpSolver;
+import com.google.ortools.sat.CpSolverStatus;
+import com.google.ortools.sat.LinearExpr;
+import com.google.ortools.sat.BoolVar;
+import com.google.ortools.sat.IntVar;
+
+import org.apache.commons.lang3.time.StopWatch;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 
@@ -36,13 +49,13 @@ public class ChallengeSolver {
   public ChallengeSolution solve(StopWatch stopWatch) {
 
     int m = aisles.size();
-    int maxK = Math.min(m, 10); // only explore up to 5 aisles
+    int maxK = Math.min(m, 5); // Explorar hasta 10 pasillos 
     
     double bestRatio = Double.NEGATIVE_INFINITY;
     Set<Integer> bestOrders = Collections.emptySet();
     Set<Integer> bestAisles = Collections.emptySet();
 
-    // Precompute for each order its total size sum_i u_{oi}
+		// Precomputar el tamaño total de cada pedido
     int[] orderSizes = new int[orders.size()];
     for (int o = 0; o < orders.size(); o++) {
       int sum = 0;
@@ -51,6 +64,7 @@ public class ChallengeSolver {
     }
 
     // Precompute each aisle's total capacity sum_i u_{ai}
+		// Precomputar la capacidad total de cada pasillo
     double[] aisleTotals = new double[m];
     for (int a = 0; a < m; a++) {
       int sum = 0;
@@ -59,12 +73,14 @@ public class ChallengeSolver {
     }
 
     // Try every k = 1..maxK
+		// Intentar cada |k| pasillos, del primero hasta maxK
     for (int k = 1; k <= maxK; k++) {
       // time check
       long remaining = TimeUnit.MILLISECONDS.toMillis(MAX_RUNTIME) - stopWatch.getTime(TimeUnit.MILLISECONDS);
       if (remaining <= 0) break;
 
       // 1) pick top-k aisles by total capacity
+			// Obtener los k pasillos con mayor capacidad total
       Integer[] idx = new Integer[m];
       for (int a = 0; a < m; a++) idx[a] = a;
       Arrays.sort(idx, Comparator.comparingDouble((Integer a) -> aisleTotals[a]).reversed());
@@ -72,6 +88,7 @@ public class ChallengeSolver {
       for (int i = 0; i < k; i++) chosenAisles.add(idx[i]);
 
       // 2) build capacity vector v_i = sum_{a in chosen} u_{ai}
+			// Construir el vector de capacidad v_i = sum_{a in chosen} u_{ai}
       int[] cap = new int[nItems];
       for (int a : chosenAisles) {
         for (Map.Entry<Integer,Integer> e : aisles.get(a).entrySet()) {
@@ -80,6 +97,7 @@ public class ChallengeSolver {
       }
 
       // 3) set up the 0–1 knapsack over orders
+			// Resolver el knapsack para poder obtener x_{ij}
       MPSolver solver = MPSolver.createSolver("SCIP");
       if (solver == null) continue;  // solver not available
 
@@ -142,9 +160,97 @@ public class ChallengeSolver {
       // small interruption check
       if (stopWatch.getTime(TimeUnit.MILLISECONDS) > MAX_RUNTIME) break;
     }
+// ————————————————  A PARTIR DE AQUÍ ARMAMOS EL CP-SAT ————————————————
+  long elapsed = stopWatch.getTime(TimeUnit.MILLISECONDS);
+  double remainingSec = Math.max(0, (MAX_RUNTIME - elapsed - 5000) / 1000.0);
 
-    // stopWatch.stop();
-    return new ChallengeSolution(bestOrders, bestAisles);
+  // 1) Creamos el modelo
+  CpModel model = new CpModel();
+
+  // 2) Variables binarias x[o] y y[a]
+  int O = orders.size(), A = aisles.size();
+  BoolVar[] x = new BoolVar[O];
+  for (int o = 0; o < O; o++) {
+    x[o] = model.newBoolVar("x_" + o);
+  }
+  BoolVar[] y = new BoolVar[A];
+  for (int a = 0; a < A; a++) {
+    y[a] = model.newBoolVar("y_" + a);
+  }
+
+  // 3) Restricciones de capacidad de ítems
+  for (int i = 0; i < nItems; i++) {
+    // sum_o x[o]*u_{oi} <= sum_a y[a]*u_{ai}
+    LinearExprBuilder left  = LinearExpr.newBuilder();
+    for (int o = 0; o < O; o++) {
+      int u_oi = orders.get(o).getOrDefault(i, 0);
+      if (u_oi > 0) left.addTerm(x[o], u_oi);
+    }
+    LinearExprBuilder right = LinearExpr.newBuilder();
+    for (int a = 0; a < A; a++) {
+      int u_ai = aisles.get(a).getOrDefault(i, 0);
+      if (u_ai > 0) right.addTerm(y[a], u_ai);
+    }
+    model.addLessOrEqual(left, right);
+  }
+
+  // 4) Restricciones de wave‐size
+  //    LB <= sum_o x[o]*orderSize[o] <= UB
+  LinearExprBuilder waveSum = LinearExpr.newBuilder();
+  for (int o = 0; o < O; o++) {
+    waveSum.addTerm(x[o], orderSizes[o]);
+  }
+  model.addGreaterOrEqual(waveSum, waveSizeLB);
+  model.addLessOrEqual   (waveSum, waveSizeUB);
+
+  // 5) Variables auxiliares para función objetivo “aprox. linealizada”
+  //    totalUnits = sum_o x[o]*orderSizes[o]
+  //    aisleCount = sum_a y[a]
+  IntVar totalUnits = model.newIntVar(0, Arrays.stream(orderSizes).sum(), "totalUnits");
+  model.addEquality(totalUnits, waveSum);
+
+  IntVar aisleCount = model.newIntVar(0, A, "aisleCount");
+  model.addEquality(aisleCount, LinearExpr.sum(y));
+
+  // 6) Objetivo: max (totalUnits*1000 - aisleCount * floor(1000*bestRatio))
+  //    con la escala evitamos fracciones y empujamos a ratios > bestRatio
+  long scale = (long)Math.floor(1000.0 * bestRatio);
+  LinearExprBuilder objExpr = LinearExpr.newBuilder()
+    .addTerm(totalUnits, 1000)
+    .addTerm(aisleCount, -scale);
+  model.maximize(objExpr);
+
+  // 7) “Hints” para arrancar en tu solución heurística
+  for (int o : bestOrders) model.addHint(x[o], 1);
+  for (int a : bestAisles) model.addHint(y[a], 1);
+
+  // 8) Resolución con límite de tiempo
+  CpSolver solver = new CpSolver();
+  solver.getParameters().setMaxTimeInSeconds(remainingSec);
+  CpSolverStatus status = solver.solve(model);
+
+  // 9) Lectura de la solución final
+  Set<Integer> finalOrders  = new HashSet<>();
+  Set<Integer> finalAisles  = new HashSet<>();
+  double finalRatio = bestRatio;  // en caso no mejore
+  if (status == CpSolverStatus.OPTIMAL || status == CpSolverStatus.FEASIBLE) {
+    int chosenAisles = 0;
+    for (int a = 0; a < A; a++) {
+      if (solver.booleanValue(y[a])) {
+        finalAisles.add(a);
+        chosenAisles++;
+      }
+    }
+    int pickedUnits = (int)solver.value(totalUnits);
+    finalRatio = (double)pickedUnits / (chosenAisles>0?chosenAisles:1);
+    for (int o = 0; o < O; o++) {
+      if (solver.booleanValue(x[o])) finalOrders.add(o);
+    }
+  }
+
+  // 10) Devolvemos la solución exacta “mejorada”
+  return new ChallengeSolution(finalOrders, finalAisles);
+
   }
 
   protected long getRemainingTime(StopWatch sw) {
