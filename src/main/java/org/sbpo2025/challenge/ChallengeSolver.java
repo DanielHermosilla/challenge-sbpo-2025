@@ -57,7 +57,10 @@ public class ChallengeSolver {
 	@SuppressWarnings("ConstantConditions")
 	public ChallengeSolution solve(StopWatch sw) {
 		int m = aisles.size();
-		int maxK = Math.min(m, 20);
+		System.out.println("[INFO] Cantidad de pasillos " + m);
+		// Cálculo de cuántos pasillos considerar como candidatos en heurística inicial
+		int candidateK = (int) Math.round(m / 9.0); // proporcional al total de pasillos
+		int maxK = Math.min(m, Math.max(1, candidateK)); // pero no más que m
 
 		// Pre-calculate order sizes
 		int[] orderSizes = new int[orders.size()];
@@ -125,7 +128,8 @@ public class ChallengeSolver {
 
 		// 2) Búsqueda local paralela durante 2 minutos
 		long startLocal = System.currentTimeMillis();
-		long localTime = Math.min(getRemainingTime(sw), 120_000L);
+		long remaining = Math.max(0L, getRemainingTime(sw) - 5_000L); // Me creo otra variable para el caso de negativos
+		long localTime = Math.min(remaining, (m > 250 ? 240_000L : 120_000L));
 		System.out.println("[LOCAL] Iniciando búsqueda local por " + localTime + " ms");
 		ExecutorService localExec = Executors.newFixedThreadPool(
 				Math.min(4, Runtime.getRuntime().availableProcessors()));
