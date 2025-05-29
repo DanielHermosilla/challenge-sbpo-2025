@@ -62,7 +62,7 @@ public class ChallengeSolver {
 		int candidateK = (int) Math.round(m / 9.0); // proporcional al total de pasillos
 		int maxK = Math.min(m, Math.max(1, candidateK)); // pero no más que m
 
-		// Pre-calculate order sizes
+		// Pre-calcular tamaño de las ordenes
 		int[] orderSizes = new int[orders.size()];
 		for (int o = 0; o < orders.size(); o++) {
 			int sum = 0;
@@ -70,7 +70,7 @@ public class ChallengeSolver {
 				sum += q;
 			orderSizes[o] = sum;
 		}
-		// Pre-calculate aisle totals
+		// Pre-calcular capacidad total de cada pasillo
 		double[] aisleTotals = new double[m];
 		for (int a = 0; a < m; a++) {
 			int sum = 0;
@@ -84,7 +84,7 @@ public class ChallengeSolver {
 		ExecutorService exec = Executors.newFixedThreadPool(
 				Math.min(maxK, Runtime.getRuntime().availableProcessors()));
 		List<Future<KResult>> futures = new ArrayList<>();
-		for (int k = 2; k <= maxK; k++) {
+		for (int k = 1; k <= maxK; k++) {
 			final int fk = k;
 			futures.add(exec.submit(() -> {
 				long remaining = getRemainingTime(sw);
@@ -107,10 +107,12 @@ public class ChallengeSolver {
 		}
 		exec.shutdown();
 		int kAct = 2;
+		boolean foundAny = false;
 		for (Future<KResult> f : futures) {
 			try {
 				KResult kr = f.get(Math.max(100, getRemainingTime(sw)), TimeUnit.MILLISECONDS);
 				if (kr != null) {
+					foundAny = true;
 					System.out.println("[INFO] K=" + kAct + " result ratio=" + kr.ratio + " aisles=" + kr.aisles);
 					if (kr.ratio > bestRatio) {
 						bestRatio = kr.ratio;
@@ -122,6 +124,16 @@ public class ChallengeSolver {
 				System.out.println("[THREAD K=" + kAct + "] error: " + e.getMessage());
 			}
 			kAct++;
+		}
+		if (!foundAny) {
+			System.out.println("[INFO] No se encontró solución con la heurística. Activando fallback greedy...");
+			Set<Integer> seed = new HashSet<>();
+			KResult kr = greedyFeasible(seed, orderSizes, sw);
+			if (kr != null) {
+				bestRatio = kr.ratio;
+				bestAisles = new HashSet<>(kr.aisles);
+				bestOrders = new HashSet<>(kr.orders);
+			}
 		}
 		System.out.println("[INFO] Heurística inicial completa: ratio=" + bestRatio + " aisles=" + bestAisles
 				+ " orders=" + bestOrders);
@@ -304,6 +316,38 @@ public class ChallengeSolver {
 			return new ChallengeSolution(finalO, finalA);
 		}
 		return new ChallengeSolution(bestOrders, bestAisles);
+	}
+
+	private KResult greedyFeasible(Set<Integer> seedAisles, int[] orderSizes, StopWatch sw) {
+		Set<Integer> candidate = new HashSet<>(seedAisles);
+		Set<Integer> remaining = new HashSet<>();
+		for (int i = 0; i < aisles.size(); i++) {
+			if (!candidate.contains(i))
+				remaining.add(i);
+		}
+		while (!remaining.isEmpty() && getRemainingTime(sw) > 0) {
+			System.out.println("[GREEDY] Intentando con pasillos: " + candidate);
+			int best = -1;
+			int bestCap = -1;
+			for (int a : remaining) {
+				int cap = 0;
+				for (int q : aisles.get(a).values())
+					cap += q;
+				if (cap > bestCap) {
+					bestCap = cap;
+					best = a;
+				}
+			}
+			if (best == -1)
+				break;
+			candidate.add(best);
+			remaining.remove(best);
+			KResult kr = solveFixed(candidate, orderSizes, getRemainingTime(sw), "GREEDY");
+			if (kr != null)
+				return kr;
+		}
+		System.out.println("[GREEDY] No se halló solución factible.");
+		return null;
 	}
 
 	protected long getRemainingTime(StopWatch sw) {
