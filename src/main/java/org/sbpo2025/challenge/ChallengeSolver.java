@@ -7,6 +7,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import org.apache.commons.lang3.time.StopWatch;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
 import com.google.ortools.Loader;
 // --- para tu knapsack con MPSolver ---
@@ -39,6 +40,7 @@ public class ChallengeSolver {
 	protected final int nItems;
 	protected final int waveSizeLB;
 	protected final int waveSizeUB;
+	private final Set<Set<Integer>> visitedAisles = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
 	// Parámetros GRASP
 	private final double alpha = 0.3; // nivel de aleatoriedad en GRASP
@@ -211,42 +213,43 @@ public class ChallengeSolver {
 					List<Integer> vec = new ArrayList<>(bestAisles);
 					int act = ThreadLocalRandom.current().nextInt(3);
 					if (act == 0 && !vec.isEmpty()) {
-						int rem = vec.remove(ThreadLocalRandom.current().nextInt(vec.size()));
-						// System.out.println("[LOCAL] remove " + rem);
+						vec.remove(ThreadLocalRandom.current().nextInt(vec.size()));
 					} else if (act == 1 && vec.size() < m) {
 						int add;
 						do {
 							add = ThreadLocalRandom.current().nextInt(m);
 						} while (vec.contains(add));
 						vec.add(add);
-						// System.out.println("[LOCAL] add " + add);
 					} else if (act == 2 && !vec.isEmpty()) {
 						int idxSwap = ThreadLocalRandom.current().nextInt(vec.size());
-						int old = vec.get(idxSwap);
 						int add;
 						do {
 							add = ThreadLocalRandom.current().nextInt(m);
 						} while (vec.contains(add));
 						vec.set(idxSwap, add);
-						// System.out.println("[LOCAL] swap " + old + "->" + add);
+					}
+
+					// ------------- evita re-evaluar -------------
+					Set<Integer> cand = new HashSet<>(vec);
+					if (!visitedAisles.add(cand)) {
+						// System.out.println("[LOCAL] saltando ya evaluado: " + cand);
+						continue;
 					}
 
 					// evaluar vecino
-					KResult kr = solveFixed(new HashSet<>(vec), orderSizes, getRemainingTime(sw), "LOCAL");
+					KResult kr = solveFixed(cand, orderSizes, getRemainingTime(sw), "LOCAL");
 					if (kr != null) {
-						// System.out.println("[LOCAL] probado " + vec + " ratio=" + kr.ratio);
 						synchronized (this) {
 							if (kr.ratio > bestRatio) {
 								bestRatio = kr.ratio;
-								bestAisles = new HashSet<>(vec);
+								bestAisles = cand;
 								bestOrders = new HashSet<>(kr.orders);
 								System.out.println("[LOCAL] ** mejora nueva ratio="
 										+ bestRatio + " aisles=" + bestAisles);
 							}
 						}
-					} else {
-						// System.out.println("[LOCAL] probado " + vec + " infactible");
 					}
+					// si kr == null, queda marcado en visitedAisles y no se reintenta
 				}
 			});
 		}
@@ -507,6 +510,26 @@ public class ChallengeSolver {
 				denom.addTerm(y[a], 1);
 			model.addGreaterOrEqual(denom, 1);
 
+			/*
+			 * long scale = 1_000;
+			 * long Zscaled = (long) Math.ceil(lambda * scale);
+			 * 
+			 * List<Integer> scaledCoeffs = Collections.nCopies(A, (int) Zscaled);
+			 * LinearExprBuilder scaledLhs = LinearExpr.newBuilder();
+			 * for (int a = 0; a < A; a++)
+			 * scaledLhs.addTerm(y[a], (int) Zscaled);
+			 * 
+			 * LinearExprBuilder scaledNumer = LinearExpr.newBuilder();
+			 * for (int o = 0; o < O; o++)
+			 * scaledNumer.addTerm(x[o], orderSizes[o] * (int) scale);
+			 * 
+			 * // Z* * D(y) <= N(x)
+			 * model.addLessOrEqual(scaledLhs.build(), scaledNumer.build());
+			 * 
+			 * // Z* * D(y) >= LB
+			 * model.addGreaterOrEqual(scaledLhs.build(), (int) (waveSizeLB * scale));
+			 */
+
 			// Objetivo Dinkelbach
 			// Redondea λ al entero hacia arriba
 			long lambdaInt = (long) Math.ceil(lambda);
@@ -521,6 +544,41 @@ public class ChallengeSolver {
 			for (int a = 0; a < A; a++) {
 				objB.addTerm(y[a], -lambdaInt);
 			}
+			// Supongamos que visitedAisles es tu Set<Set<Integer>> con todas las
+			// combinaciones
+			// que quieres prohibir para el CP-SAT:
+			/*
+			 * for (Set<Integer> forbid : visitedAisles) {
+			 * LinearExprBuilder nogood = LinearExpr.newBuilder();
+			 * // Para cada pasillo a:
+			 * for (int a = 0; a < A; a++) {
+			 * if (forbid.contains(a)) {
+			 * // si en forbid y[a]=1, sumamos (1 - y[a]) = -y[a] + 1
+			 * nogood.addTerm(y[a], -1);
+			 * nogood.add(1);
+			 * } else {
+			 * // si en forbid y[a]=0, sumamos y[a]
+			 * nogood.addTerm(y[a], 1);
+			 * }
+			 * }
+			 * // forzamos que la suma sea al menos 1, i.e. no pueda ser idéntica a forbid
+			 * model.addGreaterOrEqual(nogood, 1);
+			 * }
+			 */
+			/*
+			 * LinearExprBuilder hamDist = LinearExpr.newBuilder();
+			 * for (int a = 0; a < A; a++) {
+			 * if (bestAisles.contains(a)) {
+			 * // 1 - y[a] ≡ -1*y[a] + 1
+			 * hamDist.addTerm(y[a], -1);
+			 * hamDist.add(1); // <-- aquí pones el +1
+			 * } else {
+			 * // y[a]
+			 * hamDist.addTerm(y[a], 1);
+			 * }
+			 * }
+			 * model.addLessOrEqual(hamDist, 3);
+			 */
 			// Pasa un LinearExpr construido a maximize
 			model.maximize(objB.build());
 
@@ -531,6 +589,8 @@ public class ChallengeSolver {
 				model.addHint(y[a], 1);
 
 			CpSolver solver = new CpSolver();
+			int cores = Runtime.getRuntime().availableProcessors();
+			solver.getParameters().setNumSearchWorkers(cores);
 			solver.getParameters().setMaxTimeInSeconds(
 					Math.max(1.0, (deadline - System.currentTimeMillis()) / 1000.0));
 			CpSolverStatus status = solver.solve(model);
