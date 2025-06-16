@@ -23,6 +23,7 @@ import com.google.ortools.sat.LinearExpr;
 import com.google.ortools.sat.LinearExprBuilder;
 import com.google.ortools.sat.BoolVar;
 import com.google.ortools.sat.IntVar;
+import com.google.ortools.sat.SatParameters;
 
 /**
  * ChallengeSolver con fases: inicial (top-K), búsqueda local aleatoria (Random
@@ -580,6 +581,7 @@ public class ChallengeSolver {
 			 * model.addLessOrEqual(hamDist, 3);
 			 */
 			// Pasa un LinearExpr construido a maximize
+			// model.addGreaterOrEqual(objB.build(), 0); // Sacar si no ayuda
 			model.maximize(objB.build());
 
 			// Hints
@@ -591,6 +593,7 @@ public class ChallengeSolver {
 			CpSolver solver = new CpSolver();
 			int cores = Runtime.getRuntime().availableProcessors();
 			solver.getParameters().setNumSearchWorkers(cores);
+			// solver.getParameters().setSearchBranching(SatParameters.SearchBranching.FIXED_SEARCH);
 			solver.getParameters().setMaxTimeInSeconds(
 					Math.max(1.0, (deadline - System.currentTimeMillis()) / 1000.0));
 			CpSolverStatus status = solver.solve(model);
