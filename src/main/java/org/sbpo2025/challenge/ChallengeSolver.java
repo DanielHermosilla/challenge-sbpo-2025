@@ -1,56 +1,57 @@
 package org.sbpo2025.challenge;
 
+import org.sbpo2025.challenge.ChallengeSolution;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.stream.Collectors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+
 import org.apache.commons.lang3.time.StopWatch;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
+
 import com.google.ortools.Loader;
-// --- para tu knapsack con MPSolver ---
+
+// --- MIP (knapsack) ---
 import com.google.ortools.linearsolver.MPConstraint;
 import com.google.ortools.linearsolver.MPObjective;
 import com.google.ortools.linearsolver.MPSolver;
 import com.google.ortools.linearsolver.MPVariable;
-// --- para el CP-SAT de refinamiento ---
+
+// --- CP-SAT ---
 import com.google.ortools.sat.CpModel;
 import com.google.ortools.sat.CpSolver;
 import com.google.ortools.sat.CpSolverStatus;
 import com.google.ortools.sat.LinearExpr;
 import com.google.ortools.sat.LinearExprBuilder;
 import com.google.ortools.sat.BoolVar;
-import com.google.ortools.sat.IntVar;
-import com.google.ortools.sat.SatParameters;
 
-/**
- * ChallengeSolver con fases: inicial (top-K), búsqueda local aleatoria (Random
- * Walk),
- * GRASP multistart (construcción + LS), y refinamiento CP-SAT.
- */
 public class ChallengeSolver {
 	static {
 		Loader.loadNativeLibraries();
 	}
 
-	private final long MAX_RUNTIME = 600_000; // 10 minutos en ms
+	// ====== Parámetros globales ======
+	private final long MAX_RUNTIME = 600_000; // 10 min
 	protected final List<Map<Integer, Integer>> orders;
 	protected final List<Map<Integer, Integer>> aisles;
 	protected final int nItems;
 	protected final int waveSizeLB;
 	protected final int waveSizeUB;
+
+	// Visitados para RW
 	private final Set<Set<Integer>> visitedAisles = Collections.newSetFromMap(new ConcurrentHashMap<>());
+	// "Hotness" por pasillo descubierto en RW semilla (para poblar el GA)
+	private final Map<Integer, Integer> aisleHotness = new ConcurrentHashMap<>();
+	// Pool de subconjuntos élite provenientes del RW semilla
+	private final List<Set<Integer>> rwElitePool = Collections.synchronizedList(new ArrayList<>());
 
-	// Parámetros GRASP
-	private final double alpha = 0.3; // nivel de aleatoriedad en GRASP
-	private final int maxGraspIters = 50; // iteraciones GRASP
-
-	// Resultado global compartido entre fases
-	private volatile double bestRatio;
-	private volatile Set<Integer> bestAisles;
-	private volatile Set<Integer> bestOrders;
+	// Resultado global (incumbente)
+	private volatile double bestRatio = Double.NEGATIVE_INFINITY;
+	private volatile Set<Integer> bestAisles = new HashSet<>();
+	private volatile Set<Integer> bestOrders = new HashSet<>();
 
 	public ChallengeSolver(
 			List<Map<Integer, Integer>> orders,
@@ -63,50 +64,43 @@ public class ChallengeSolver {
 		this.nItems = nItems;
 		this.waveSizeLB = waveSizeLB;
 		this.waveSizeUB = waveSizeUB;
-		this.bestRatio = Double.NEGATIVE_INFINITY;
-		this.bestAisles = new HashSet<>();
-		this.bestOrders = new HashSet<>();
 	}
 
-	/** Flujo principal de la solución. */
+	/** Flujo completo */
 	public ChallengeSolution solve(StopWatch sw) {
 		int m = aisles.size();
-		System.out.println("[INFO] Cantidad de pasillos = " + m);
+		System.out.println("[INFO] Pasillos=" + m);
 
-		// Pre-cálculos: tamaños de órdenes y capacidad total de cada pasillo
+		// Pre-cálculos simples
 		int[] orderSizes = new int[orders.size()];
-		for (int o = 0; o < orders.size(); o++) {
+		for (int o = 0; o < orders.size(); o++)
 			orderSizes[o] = orders.get(o).values().stream().mapToInt(i -> i).sum();
-		}
-		double[] aisleTotals = new double[m];
-		for (int a = 0; a < m; a++) {
-			aisleTotals[a] = aisles.get(a).values().stream().mapToInt(i -> i).sum();
-		}
 
-		// 1) Fase inicial: top-K knapsack paralelo
+		double[] aisleTotals = new double[m];
+		for (int a = 0; a < m; a++)
+			aisleTotals[a] = aisles.get(a).values().stream().mapToInt(i -> i).sum();
+
+		// 1) Fase inicial (incumbente)
 		runInitialPhase(aisleTotals, orderSizes, sw);
 
-		// 2) Búsqueda local aleatoria (Random Walk)
-		System.out.println("[RW] Iniciando búsqueda local aleatoria");
+		// 2) Random Walk SEMILLA corto para detectar "mejores pasillos" (hotness) y
+		// pool élite
+		System.out.println("[SEED-RW] Exploración breve para guiar GA…");
+		seedRandomWalk(sw, orderSizes);
+
+		// 3) GA usando incumbente + distribución ponderada por hotness + pool élite RW
+		System.out.println("[GA] Iniciando GA con incumbente + hotness RW");
+		runGeneticPhase(orderSizes, sw);
+		System.out.println("[GA] Terminado | ratio=" + bestRatio + " | aisles=" + bestAisles);
+
+		// 4) Random Walk intensivo (explotación local final)
+		System.out.println("[RW] Intensificación final");
 		randomWalk(sw, orderSizes);
-		System.out.println("[RW] Finalizado RW, mejor ratio=" + bestRatio + " pasillos=" + bestAisles);
+		System.out.println("[RW] Finalizado | ratio=" + bestRatio + " | aisles=" + bestAisles);
 
-		// System.out.println("[RW] Iniciando búsqueda local aleatoria 2");
-		// randomWalk(sw, orderSizes);
-		// System.out.println("[RW] Finalizado RW 2, mejor ratio=" + bestRatio + "
-		// pasillos=" + bestAisles);
-
-		// 3) GRASP multistart tras RW
-		// System.out.println("[GRASP] Iniciando GRASP multistart");
-		// KResult graspRes = runGRASP(bestAisles, orderSizes, sw);
-		// updateBest(graspRes);
-		// System.out.println("[GRASP] Mejor GRASP: ratio=" + bestRatio + " pasillos=" +
-		// bestAisles);
-
-		// 4) Refinamiento final con CP-SAT
-		double remSec = Math.max(0,
-				(MAX_RUNTIME - sw.getTime(TimeUnit.MILLISECONDS) - 5000) / 1000.0);
-		System.out.println("[INFO] Refinando con CP-SAT, tiempo restante (s)=" + remSec);
+		// 5) Refinamiento CP-SAT (Dinkelbach)
+		double remSec = Math.max(0, (MAX_RUNTIME - sw.getTime(TimeUnit.MILLISECONDS) - 5000) / 1000.0);
+		System.out.println("[INFO] CP-SAT con tiempo restante(s)=" + remSec);
 		return cpSatDinkelbach(bestOrders, bestAisles, orderSizes, sw, remSec);
 	}
 
@@ -115,9 +109,9 @@ public class ChallengeSolver {
 		int m = aisleTotals.length;
 		int candidateK = Math.max(1, (int) Math.round(m / 9.0));
 		int maxK = Math.min(m, candidateK);
-		System.out.println("[INIT] Iniciando fase inicial K=1.." + maxK);
-		ExecutorService exec = Executors.newFixedThreadPool(
-				Math.min(maxK, Runtime.getRuntime().availableProcessors()));
+		System.out.println("[INIT] K=1.." + maxK);
+
+		ExecutorService exec = Executors.newFixedThreadPool(Math.min(maxK, Runtime.getRuntime().availableProcessors()));
 		List<Future<KResult>> futures = new ArrayList<>();
 		for (int k = 1; k <= maxK; k++) {
 			final int fk = k;
@@ -126,17 +120,15 @@ public class ChallengeSolver {
 		exec.shutdown();
 		collectKResults(futures, sw);
 
-		// Fallback greedy si no se encontró solución
 		if (bestRatio == Double.NEGATIVE_INFINITY) {
-			System.out.println("[INIT] Fallback greedy factible...");
+			System.out.println("[INIT] Greedy fallback…");
 			KResult kr = greedyFeasible(new HashSet<>(), orderSizes, sw);
 			updateBest(kr);
 		}
-		System.out.println("[INIT] Fase inicial completa: ratio=" + bestRatio + " pasillos=" + bestAisles);
+		System.out.println("[INIT] Hecho | ratio=" + bestRatio + " | aisles=" + bestAisles);
 	}
 
 	private KResult solveFixedTopK(int k, double[] totals, int[] orderSizes, StopWatch sw) {
-		System.out.println("[INIT K=" + k + "] seleccionando top-" + k);
 		Integer[] idx = new Integer[totals.length];
 		for (int i = 0; i < totals.length; i++)
 			idx[i] = i;
@@ -153,7 +145,7 @@ public class ChallengeSolver {
 			try {
 				KResult kr = f.get(Math.max(100, getRemainingTime(sw)), TimeUnit.MILLISECONDS);
 				if (kr != null) {
-					System.out.println("[INIT K=" + kAct + "] ratio=" + kr.ratio + " pasillos=" + kr.aisles);
+					System.out.println("[INIT K=" + kAct + "] ratio=" + kr.ratio + " aisles=" + kr.aisles);
 					updateBest(kr);
 				}
 			} catch (Exception e) {
@@ -169,6 +161,7 @@ public class ChallengeSolver {
 		for (int i = 0; i < aisles.size(); i++)
 			if (!candidate.contains(i))
 				remaining.add(i);
+
 		while (!remaining.isEmpty() && getRemainingTime(sw) > 0) {
 			int best = -1, bestCap = -1;
 			for (int a : remaining) {
@@ -189,68 +182,117 @@ public class ChallengeSolver {
 		return null;
 	}
 
-	// ========================= FASE RANDOM WALK =========================
+	// ========================= RW SEMILLA PARA GA =========================
 	/**
-	 * Random Walk (búsqueda local aleatoria) usando tu código original,
-	 * con los mismos prints, adaptada a la firma de “randomWalk”.
-	 *
-	 * @param sw         StopWatch para controlar el timeout total.
-	 * @param orderSizes arreglo pre-calculado de tamaños de órdenes.
+	 * RW corto para construir "hotness" por pasillo y un pool élite de
+	 * subconjuntos.
 	 */
+	private void seedRandomWalk(StopWatch sw, int[] orderSizes) {
+		final int m = aisles.size();
+		long budget = Math.max(3_000L, Math.min(20_000L, getRemainingTime(sw) / 10)); // 10% del tiempo restante
+		long start = System.currentTimeMillis();
+
+		Set<Integer> current = new HashSet<>(bestAisles);
+		double currScore = bestRatio;
+
+		while (System.currentTimeMillis() - start < budget) {
+			List<Integer> vec = new ArrayList<>(current);
+			int act = ThreadLocalRandom.current().nextInt(3);
+			if (act == 0 && !vec.isEmpty()) {
+				vec.remove(ThreadLocalRandom.current().nextInt(vec.size()));
+			} else if (act == 1 && vec.size() < m) {
+				int add;
+				do
+					add = ThreadLocalRandom.current().nextInt(m);
+				while (vec.contains(add));
+				vec.add(add);
+			} else if (act == 2 && !vec.isEmpty()) {
+				int idxSwap = ThreadLocalRandom.current().nextInt(vec.size());
+				int add;
+				do
+					add = ThreadLocalRandom.current().nextInt(m);
+				while (vec.contains(add));
+				vec.set(idxSwap, add);
+			}
+
+			Set<Integer> cand = new HashSet<>(vec);
+			if (!visitedAisles.add(cand))
+				continue;
+
+			KResult kr = solveFixed(cand, orderSizes, Math.max(200, getRemainingTime(sw) / 15), "SEED-RW");
+			if (kr == null)
+				continue;
+
+			// Actualiza hotness por cada pasillo presente en una solución con buen ratio
+			double score = kr.ratio;
+			if (score >= currScore || ThreadLocalRandom.current().nextDouble() < 0.15) {
+				for (int a : cand)
+					aisleHotness.merge(a, 1, Integer::sum);
+			}
+			// Guarda un pool élite pequeño
+			if (rwElitePool.size() < 20 || score > currScore) {
+				rwElitePool.add(new HashSet<>(cand));
+				while (rwElitePool.size() > 30)
+					rwElitePool.remove(0);
+			}
+			if (score > currScore) {
+				currScore = score;
+				current = cand;
+				updateBest(kr);
+			}
+		}
+		if (aisleHotness.isEmpty()) {
+			// fallback: da algo de peso a los incumbentes
+			for (int a : bestAisles)
+				aisleHotness.put(a, 2);
+		}
+		System.out.println("[SEED-RW] Hotness size=" + aisleHotness.size() + " | ElitePool=" + rwElitePool.size());
+	}
+
+	// ========================= RW INTENSIVO =========================
 	private void randomWalk(StopWatch sw, int[] orderSizes) {
 		int m = aisles.size();
 		long startLocal = System.currentTimeMillis();
 		long remaining = Math.max(0, getRemainingTime(sw) - 5_000L);
 		long localTime = Math.min(remaining, (m > 250 ? 240_000L : 120_000L));
 
-		System.out.println("[LOCAL] Iniciando búsqueda local por " + localTime + " ms");
-		ExecutorService localExec = Executors.newFixedThreadPool(
-				Math.min(4, Runtime.getRuntime().availableProcessors()));
+		System.out.println("[LOCAL] Tiempo=" + localTime + " ms");
+		ExecutorService localExec = Executors
+				.newFixedThreadPool(Math.min(4, Runtime.getRuntime().availableProcessors()));
 
 		for (int t = 0; t < Math.min(4, Runtime.getRuntime().availableProcessors()); t++) {
 			localExec.submit(() -> {
+				ThreadLocalRandom rnd = ThreadLocalRandom.current();
 				while (System.currentTimeMillis() - startLocal < localTime) {
-					// generar vecino
 					List<Integer> vec = new ArrayList<>(bestAisles);
-					int act = ThreadLocalRandom.current().nextInt(3);
-					if (act == 0 && !vec.isEmpty()) {
-						vec.remove(ThreadLocalRandom.current().nextInt(vec.size()));
-					} else if (act == 1 && vec.size() < m) {
+					int act = rnd.nextInt(3);
+					if (act == 0 && !vec.isEmpty())
+						vec.remove(rnd.nextInt(vec.size()));
+					else if (act == 1 && vec.size() < m) {
 						int add;
-						do {
-							add = ThreadLocalRandom.current().nextInt(m);
-						} while (vec.contains(add));
+						do
+							add = rnd.nextInt(m);
+						while (vec.contains(add));
 						vec.add(add);
 					} else if (act == 2 && !vec.isEmpty()) {
-						int idxSwap = ThreadLocalRandom.current().nextInt(vec.size());
+						int idxSwap = rnd.nextInt(vec.size());
 						int add;
-						do {
-							add = ThreadLocalRandom.current().nextInt(m);
-						} while (vec.contains(add));
+						do
+							add = rnd.nextInt(m);
+						while (vec.contains(add));
 						vec.set(idxSwap, add);
 					}
-
-					// ------------- evita re-evaluar -------------
 					Set<Integer> cand = new HashSet<>(vec);
-					if (!visitedAisles.add(cand)) {
-						// System.out.println("[LOCAL] saltando ya evaluado: " + cand);
+					if (!visitedAisles.add(cand))
 						continue;
-					}
 
-					// evaluar vecino
-					KResult kr = solveFixed(cand, orderSizes, getRemainingTime(sw), "LOCAL");
-					if (kr != null) {
+					KResult kr = solveFixed(cand, orderSizes, Math.max(200, getRemainingTime(sw) / 12), "LOCAL");
+					if (kr != null && kr.ratio > bestRatio) {
 						synchronized (this) {
-							if (kr.ratio > bestRatio) {
-								bestRatio = kr.ratio;
-								bestAisles = cand;
-								bestOrders = new HashSet<>(kr.orders);
-								System.out.println("[LOCAL] ** mejora nueva ratio="
-										+ bestRatio + " aisles=" + bestAisles);
-							}
+							updateBest(kr);
 						}
+						System.out.println("[LOCAL] ** mejora ratio=" + bestRatio + " aisles=" + bestAisles);
 					}
-					// si kr == null, queda marcado en visitedAisles y no se reintenta
 				}
 			});
 		}
@@ -261,146 +303,225 @@ public class ChallengeSolver {
 		} catch (InterruptedException ignored) {
 			Thread.currentThread().interrupt();
 		}
-		System.out.println("[LOCAL] Búsqueda local finalizada: ratio="
-				+ bestRatio + " aisles=" + bestAisles);
+
+		System.out.println("[LOCAL] Fin | ratio=" + bestRatio + " | aisles=" + bestAisles);
 	}
 
-	// ========================= FASE GRASP =========================
-	private KResult runGRASP(Set<Integer> seed, int[] orderSizes, StopWatch sw) {
-		KResult bestGrasp = new KResult(bestRatio, seed, bestOrders);
-		// Semilla que iremos actualizando
-		Set<Integer> currentSeed = new HashSet<>(seed);
+	// ========================= GA =========================
+	/**
+	 * GA sobre selección de pasillos. Población inicial:
+	 * - Incumbente (mejorAisles) + perturbaciones locales
+	 * - Individuos muestreados ponderando pasillos por "hotness" del RW semilla
+	 * - Subconjuntos élite del RW
+	 */
+	private void runGeneticPhase(int[] orderSizes, StopWatch sw) {
+		final int m = aisles.size();
 
-		for (int it = 0; it < maxGraspIters && getRemainingTime(sw) > 0; it++) {
-			System.out.println("[GRASP] iter=" + it);
-			// Construcción greedy-aleatorizada a partir de la semilla actual
-			Set<Integer> sol = greedyRandomizedConstruct(currentSeed, orderSizes, sw);
-			KResult kr = solveFixed(sol, orderSizes, getRemainingTime(sw), "GRC");
-			if (kr != null) {
-				// Mejora local
-				KResult improved = sequentialLocalSearch(kr, orderSizes, sw);
-				if (improved.ratio > bestGrasp.ratio) {
-					bestGrasp = improved;
-					// Actualizamos la semilla para la siguiente iteración
-					currentSeed = new HashSet<>(improved.aisles);
-					System.out.println("[GRASP] mejora iter=" + it
-							+ " ratio=" + improved.ratio);
-				}
+		final int POP_SIZE = Math.max(40, Math.min(120, m));
+		final int ELITES = Math.max(2, POP_SIZE / 10);
+		final int TOURN_K = 3;
+		final double PC = 0.9;
+		final double PM = Math.min(0.25, 3.0 / Math.max(4, m));
+		final int MAX_GENS = 60;
+		final long GA_BUDGET_MS = Math.max(5_000L, Math.min(60_000L, getRemainingTime(sw) - 8_000L));
+
+		System.out.printf(Locale.US,
+				"[GA] POP=%d elites=%d Pc=%.2f Pm=%.4f gens=%d time=%dms%n",
+				POP_SIZE, ELITES, PC, PM, MAX_GENS, GA_BUDGET_MS);
+
+		// Helpers
+		final java.util.function.Function<boolean[], Set<Integer>> toSet = (bits) -> {
+			Set<Integer> s = new HashSet<>();
+			for (int i = 0; i < bits.length; i++)
+				if (bits[i])
+					s.add(i);
+			return s;
+		};
+		final java.util.function.Function<Set<Integer>, boolean[]> fromSet = (set) -> {
+			boolean[] b = new boolean[m];
+			for (int a : set)
+				if (a >= 0 && a < m)
+					b[a] = true;
+			return b;
+		};
+
+		// ---- Población inicial
+		ThreadLocalRandom tlr = ThreadLocalRandom.current();
+		List<boolean[]> population = new ArrayList<>(POP_SIZE);
+
+		// 0) Inserta incumbente (si existe)
+		boolean[] seed = fromSet.apply(bestAisles);
+		population.add(seed.clone());
+
+		// 1) Variaciones del incumbente (flips pequeños)
+		while (population.size() < Math.max(5, POP_SIZE / 3)) {
+			boolean[] ind = seed.clone();
+			int flips = 1 + tlr.nextInt(Math.max(1, Math.max(2, m / 12)));
+			for (int f = 0; f < flips; f++) {
+				int pos = tlr.nextInt(m);
+				ind[pos] = !ind[pos];
 			}
-		}
-		return bestGrasp;
-	}
-
-	private Set<Integer> greedyRandomizedConstruct(Set<Integer> reference,
-			int[] orderSizes,
-			StopWatch sw) {
-		// 1) Partimos de la mejor solución hasta ahora:
-		Set<Integer> sol = new HashSet<>(reference);
-
-		// 2) Rompemos el óptimo local eliminando un pasillo al azar
-		if (!sol.isEmpty()) {
-			int rem = sol.iterator().next();
-			sol.remove(rem);
-			System.out.println("[GRC] diversifico eliminando pasillo=" + rem);
+			population.add(ind);
 		}
 
-		int targetSize = reference.size();
-		// 3) Completamos hasta volver al tamaño inicial
-		while (sol.size() < targetSize && getRemainingTime(sw) > 0) {
-			// Calcular ganancia marginal para cada candidato
-			Map<Integer, Double> delta = new HashMap<>();
-			for (int a = 0; a < aisles.size(); a++) {
-				if (!sol.contains(a)) {
-					Set<Integer> cand = new HashSet<>(sol);
-					cand.add(a);
-					KResult kr = solveFixed(cand, orderSizes, getRemainingTime(sw), "GRC");
-					delta.put(a, (kr != null) ? kr.ratio : Double.NEGATIVE_INFINITY);
-				}
-			}
-			if (delta.isEmpty())
+		// 2) Individuos tomados de la élite del RW (si hay)
+		Collections.shuffle(rwElitePool);
+		for (Set<Integer> elite : rwElitePool) {
+			if (population.size() >= POP_SIZE)
 				break;
-
-			double maxD = Collections.max(delta.values());
-			double minD = Collections.min(delta.values());
-			double thr = maxD - alpha * (maxD - minD);
-
-			// Construir la RCL y escoger aleatoriamente
-			List<Integer> rcl = delta.entrySet().stream()
-					.filter(e -> e.getValue() >= thr)
-					.map(Map.Entry::getKey)
-					.collect(Collectors.toList());
-
-			int pick = rcl.get(ThreadLocalRandom.current().nextInt(rcl.size()));
-			sol.add(pick);
-			System.out.println("[GRC] add pasillo=" + pick);
+			population.add(fromSet.apply(elite));
 		}
 
-		return sol;
-	}
+		// 3) Resto con muestreo ponderado por "hotness" (si no hay hotness ->
+		// aleatorio)
+		int[] hotKeys = aisleHotness.keySet().stream().mapToInt(Integer::intValue).toArray();
+		double[] hotW = Arrays.stream(hotKeys).mapToDouble(k -> Math.max(1, aisleHotness.getOrDefault(k, 1))).toArray();
+		double sumW = Arrays.stream(hotW).sum();
 
-	private KResult sequentialLocalSearch(KResult start, int[] orderSizes, StopWatch sw) {
-		Set<Integer> currentA = new HashSet<>(start.aisles);
-		double currentR = start.ratio;
-		Set<Integer> currentO = new HashSet<>(start.orders);
-		boolean improved;
-		do {
-			improved = false;
-			for (int a : new HashSet<>(currentA)) {
-				Set<Integer> cand = new HashSet<>(currentA);
-				cand.remove(a);
-				KResult kr = solveFixed(cand, orderSizes, getRemainingTime(sw), "LS");
-				if (kr != null && kr.ratio > currentR) {
-					currentA = kr.aisles;
-					currentO = kr.orders;
-					currentR = kr.ratio;
-					System.out.println("[LS] remove mejora=" + a + " ratio=" + currentR);
-					improved = true;
+		while (population.size() < POP_SIZE) {
+			boolean[] ind = new boolean[m];
+			int ones = 1 + tlr.nextInt(Math.max(2, m / 6));
+			for (int k = 0; k < ones; k++) {
+				int a = weightedPick(hotKeys, hotW, sumW, tlr, m);
+				ind[a] = true;
+			}
+			population.add(ind);
+		}
+
+		long gaStart = System.currentTimeMillis();
+		int gen = 0;
+		Scored globalBest = new Scored(fromSet.apply(bestAisles), new KResult(bestRatio, bestAisles, bestOrders));
+
+		while (gen < MAX_GENS && System.currentTimeMillis() - gaStart < GA_BUDGET_MS && getRemainingTime(sw) > 5_000L) {
+			final int genIdx = gen + 1;
+			final long evalTimeout = Math.max(300, getRemainingTime(sw) / 10);
+			final List<boolean[]> popSnapshot = Collections.unmodifiableList(new ArrayList<>(population));
+
+			List<Scored> scored = popSnapshot.parallelStream().unordered()
+					.map(ind -> {
+						Set<Integer> A = toSet.apply(ind);
+						KResult kr = solveFixed(A, orderSizes, evalTimeout, "GA");
+						return new Scored(ind, kr);
+					}).collect(Collectors.toList());
+
+			double best = scored.stream().mapToDouble(s -> s.score).max().orElse(Double.NEGATIVE_INFINITY);
+			double avg = scored.stream().mapToDouble(s -> s.score)
+					.filter(d -> d > Double.NEGATIVE_INFINITY / 2).average().orElse(Double.NEGATIVE_INFINITY);
+			long feas = scored.stream().filter(s -> s.score > Double.NEGATIVE_INFINITY / 2).count();
+
+			Optional<Scored> bestNow = scored.stream().max(Comparator.comparingDouble(s -> s.score));
+			if (bestNow.isPresent() && bestNow.get().score > globalBest.score) {
+				globalBest = bestNow.get();
+				updateBest(globalBest.kr);
+				System.out.printf(Locale.US,
+						"[GA][gen=%d] ** MEJORA GLOBAL ** ratio=%.6f | aisles=%s | orders=%s%n",
+						genIdx, globalBest.score, globalBest.kr.aisles, globalBest.kr.orders);
+			}
+
+			System.out.printf(Locale.US,
+					"[GA][gen=%d] feas=%d/%d | best=%.6f | avg=%.6f | t=%.1fs%n",
+					genIdx, feas, scored.size(), best, avg, (System.currentTimeMillis() - gaStart) / 1000.0);
+
+			// ---- Elitismo
+			scored.sort(Comparator.comparingDouble((Scored s) -> s.score).reversed());
+			List<boolean[]> nextPop = new ArrayList<>(POP_SIZE);
+			int elitesAdded = 0;
+			for (Scored s : scored) {
+				if (elitesAdded >= ELITES)
 					break;
+				if (s.score > Double.NEGATIVE_INFINITY / 2) {
+					nextPop.add(s.ind.clone());
+					elitesAdded++;
 				}
 			}
-			if (!improved) {
-				for (int a = 0; a < aisles.size(); a++) {
-					if (!currentA.contains(a)) {
-						Set<Integer> cand = new HashSet<>(currentA);
-						cand.add(a);
-						KResult kr = solveFixed(cand, orderSizes, getRemainingTime(sw), "LS");
-						if (kr != null && kr.ratio > currentR) {
-							currentA = kr.aisles;
-							currentO = kr.orders;
-							currentR = kr.ratio;
-							System.out.println("[LS] add mejora=" + a + " ratio=" + currentR);
-							improved = true;
-							break;
-						}
-					}
-				}
+			if (elitesAdded == 0 && !scored.isEmpty())
+				nextPop.add(scored.get(0).ind.clone());
+
+			// ---- Selección por torneo + reproducción
+			final int poolSize = Math.max(ELITES, Math.min(scored.size(), POP_SIZE));
+			final List<Scored> pool = scored.subList(0, poolSize);
+			ThreadLocalRandom rnd = ThreadLocalRandom.current();
+
+			while (nextPop.size() < POP_SIZE) {
+				boolean[] p1 = tournamentSelect(pool, TOURN_K).ind;
+				boolean[] p2 = tournamentSelect(pool, TOURN_K).ind;
+				boolean[] c1 = p1.clone(), c2 = p2.clone();
+				if (rnd.nextDouble() < PC)
+					uniformCrossover(c1, c2, rnd);
+				mutateBits(c1, PM, rnd);
+				mutateBits(c2, PM, rnd);
+				nextPop.add(c1);
+				if (nextPop.size() < POP_SIZE)
+					nextPop.add(c2);
 			}
-		} while (improved && getRemainingTime(sw) > 0);
-		return new KResult(currentR, currentA, currentO);
+			population = nextPop;
+			gen++;
+		}
+
+		if (globalBest.kr != null && globalBest.kr.ratio > bestRatio)
+			updateBest(globalBest.kr);
 	}
 
-	// ========================= KNAPSACK (MPSolver) =========================
-	private KResult solveFixed(
-			Set<Integer> chosenA,
-			int[] orderSizes,
-			long remaining,
-			String tag) {
-		// Construir capacidad por ítem
-		int[] cap = new int[nItems];
-		for (int a : chosenA) {
-			for (var e : aisles.get(a).entrySet()) {
-				cap[e.getKey()] += e.getValue();
-			}
+	// Pick ponderado por hotness; si no hay hotness, pick uniforme
+	private int weightedPick(int[] hotKeys, double[] hotW, double sumW, ThreadLocalRandom tlr, int m) {
+		if (hotKeys.length == 0 || sumW <= 0)
+			return tlr.nextInt(m);
+		double r = tlr.nextDouble(sumW);
+		double acc = 0;
+		for (int i = 0; i < hotKeys.length; i++) {
+			acc += hotW[i];
+			if (r <= acc)
+				return hotKeys[i];
 		}
+		return hotKeys[hotKeys.length - 1];
+	}
+
+	// Selección torneo
+	private Scored tournamentSelect(List<Scored> pool, int k) {
+		ThreadLocalRandom tlr = ThreadLocalRandom.current();
+		Scored best = null;
+		for (int i = 0; i < k; i++) {
+			Scored cand = pool.get(tlr.nextInt(pool.size()));
+			if (best == null || cand.score > best.score)
+				best = cand;
+		}
+		return best;
+	}
+
+	// Crossover uniforme
+	private void uniformCrossover(boolean[] a, boolean[] b, ThreadLocalRandom tlr) {
+		for (int i = 0; i < a.length; i++)
+			if (tlr.nextBoolean()) {
+				boolean t = a[i];
+				a[i] = b[i];
+				b[i] = t;
+			}
+	}
+
+	// Mutación bit-flip
+	private void mutateBits(boolean[] ind, double p, ThreadLocalRandom tlr) {
+		for (int i = 0; i < ind.length; i++)
+			if (tlr.nextDouble() < p)
+				ind[i] = !ind[i];
+	}
+
+	// ========================= MIP (knapsack) =========================
+	private KResult solveFixed(Set<Integer> chosenA, int[] orderSizes, long remaining, String tag) {
+		int[] cap = new int[nItems];
+		for (int a : chosenA)
+			for (var e : aisles.get(a).entrySet())
+				cap[e.getKey()] += e.getValue();
+
 		MPSolver solver = MPSolver.createSolver("SCIP");
 		if (solver == null)
 			return null;
+
 		solver.setTimeLimit(Math.max(200, remaining / 10));
 		int O = orders.size();
 		MPVariable[] x = new MPVariable[O];
 		for (int o = 0; o < O; o++)
 			x[o] = solver.makeBoolVar("x_" + o);
-		// Restricciones de capacidad
+
 		for (int i = 0; i < nItems; i++) {
 			MPConstraint c = solver.makeConstraint(0, cap[i], "item_" + i);
 			for (int o = 0; o < O; o++) {
@@ -409,66 +530,42 @@ public class ChallengeSolver {
 					c.setCoefficient(x[o], q);
 			}
 		}
-		// Restricciones waveSize LB/UB
 		MPConstraint lb = solver.makeConstraint(waveSizeLB, Double.POSITIVE_INFINITY, "lb");
 		MPConstraint ub = solver.makeConstraint(Double.NEGATIVE_INFINITY, waveSizeUB, "ub");
 		for (int o = 0; o < O; o++) {
 			lb.setCoefficient(x[o], orderSizes[o]);
 			ub.setCoefficient(x[o], orderSizes[o]);
 		}
-		// Objetivo: maximizar unidades / pasillos
+
 		MPObjective obj = solver.objective();
 		for (int o = 0; o < O; o++)
 			obj.setCoefficient(x[o], orderSizes[o]);
 		obj.setMaximization();
+
 		MPSolver.ResultStatus status = solver.solve();
 		if (status == MPSolver.ResultStatus.OPTIMAL || status == MPSolver.ResultStatus.FEASIBLE) {
 			double totalUnits = obj.value();
 			double ratio = totalUnits / Math.max(1, chosenA.size());
 			Set<Integer> selOrders = new HashSet<>();
-			for (int o = 0; o < O; o++) {
+			for (int o = 0; o < O; o++)
 				if (x[o].solutionValue() > 0.5)
 					selOrders.add(o);
-			}
 			return new KResult(ratio, chosenA, selOrders);
 		}
 		return null;
 	}
 
-	// ========================= REFINAMIENTO CP-SAT =========================
-	/**
-	 * Refinamiento iterativo con método de Dinkelbach usando CP-SAT.
-	 * Imprime el estado (N, D, gap, ratio) en cada iteración.
-	 *
-	 * @param ordersSeed Órdenes semilla para hints
-	 * @param aislesSeed Pasillos semilla para hints
-	 * @param orderSizes Pre-cálculo de tamaños de órdenes
-	 * @param sw         StopWatch para controlar timeout total
-	 * @param remSec     Segundos restantes para CP-SAT
-	 * @return Solución refinada
-	 */
-
-	/**
-	 * Refinamiento iterativo con Dinkelbach, iniciando λ en el ratio de la semilla.
-	 */
+	// ========================= CP-SAT (Dinkelbach) =========================
 	private ChallengeSolution cpSatDinkelbach(
-			Set<Integer> ordersSeed,
-			Set<Integer> aislesSeed,
-			int[] orderSizes,
-			StopWatch sw,
-			double remSec) {
-		int O = orders.size(), A = aisles.size();
-		// Empezamos λ en el ratio actual (de bestRatio o calculado a partir de la
-		// semilla)
-		double lambda = bestRatio;
-		double tol = 1e-6;
-		double bestRatioLocal = lambda;
-		ChallengeSolution bestSol = new ChallengeSolution(bestOrders, bestAisles);
+			Set<Integer> ordersSeed, Set<Integer> aislesSeed, int[] orderSizes, StopWatch sw, double remSec) {
 
+		int O = orders.size(), A = aisles.size();
+		double lambda = bestRatio, tol = 1e-6, bestRatioLocal = lambda;
+		ChallengeSolution bestSol = new ChallengeSolution(bestOrders, bestAisles);
 		long deadline = System.currentTimeMillis() + (long) ((remSec - 1.0) * 1000);
 
 		for (int it = 1; it <= 50 && System.currentTimeMillis() < deadline; it++) {
-			System.out.println("[DINK] Iteración " + it + " con λ=" + lambda);
+			System.out.println("[DINK] iter=" + it + " λ=" + lambda);
 
 			CpModel model = new CpModel();
 			BoolVar[] x = new BoolVar[O];
@@ -478,7 +575,6 @@ public class ChallengeSolver {
 			for (int i = 0; i < A; i++)
 				y[i] = model.newBoolVar("y_" + i);
 
-			// Restricciones de capacidad
 			for (int item = 0; item < nItems; item++) {
 				LinearExprBuilder lhs = LinearExpr.newBuilder();
 				for (int o = 0; o < O; o++) {
@@ -495,14 +591,12 @@ public class ChallengeSolver {
 				model.addLessOrEqual(lhs, rhs);
 			}
 
-			// LB/UB de wave
 			LinearExprBuilder waveSum = LinearExpr.newBuilder();
 			for (int o = 0; o < O; o++)
 				waveSum.addTerm(x[o], orderSizes[o]);
 			model.addGreaterOrEqual(waveSum, waveSizeLB);
 			model.addLessOrEqual(waveSum, waveSizeUB);
 
-			// Numerador y denominador
 			LinearExprBuilder numer = LinearExpr.newBuilder();
 			for (int o = 0; o < O; o++)
 				numer.addTerm(x[o], orderSizes[o]);
@@ -511,80 +605,14 @@ public class ChallengeSolver {
 				denom.addTerm(y[a], 1);
 			model.addGreaterOrEqual(denom, 1);
 
-			/*
-			 * long scale = 1_000;
-			 * long Zscaled = (long) Math.ceil(lambda * scale);
-			 * 
-			 * List<Integer> scaledCoeffs = Collections.nCopies(A, (int) Zscaled);
-			 * LinearExprBuilder scaledLhs = LinearExpr.newBuilder();
-			 * for (int a = 0; a < A; a++)
-			 * scaledLhs.addTerm(y[a], (int) Zscaled);
-			 * 
-			 * LinearExprBuilder scaledNumer = LinearExpr.newBuilder();
-			 * for (int o = 0; o < O; o++)
-			 * scaledNumer.addTerm(x[o], orderSizes[o] * (int) scale);
-			 * 
-			 * // Z* * D(y) <= N(x)
-			 * model.addLessOrEqual(scaledLhs.build(), scaledNumer.build());
-			 * 
-			 * // Z* * D(y) >= LB
-			 * model.addGreaterOrEqual(scaledLhs.build(), (int) (waveSizeLB * scale));
-			 */
-
-			// Objetivo Dinkelbach
-			// Redondea λ al entero hacia arriba
 			long lambdaInt = (long) Math.ceil(lambda);
-
-			// Construye la expresión objetivo manualmente
 			LinearExprBuilder objB = LinearExpr.newBuilder();
-			// N(x)
-			for (int o = 0; o < O; o++) {
+			for (int o = 0; o < O; o++)
 				objB.addTerm(x[o], orderSizes[o]);
-			}
-			// –λ·D(y)
-			for (int a = 0; a < A; a++) {
+			for (int a = 0; a < A; a++)
 				objB.addTerm(y[a], -lambdaInt);
-			}
-			// Supongamos que visitedAisles es tu Set<Set<Integer>> con todas las
-			// combinaciones
-			// que quieres prohibir para el CP-SAT:
-			/*
-			 * for (Set<Integer> forbid : visitedAisles) {
-			 * LinearExprBuilder nogood = LinearExpr.newBuilder();
-			 * // Para cada pasillo a:
-			 * for (int a = 0; a < A; a++) {
-			 * if (forbid.contains(a)) {
-			 * // si en forbid y[a]=1, sumamos (1 - y[a]) = -y[a] + 1
-			 * nogood.addTerm(y[a], -1);
-			 * nogood.add(1);
-			 * } else {
-			 * // si en forbid y[a]=0, sumamos y[a]
-			 * nogood.addTerm(y[a], 1);
-			 * }
-			 * }
-			 * // forzamos que la suma sea al menos 1, i.e. no pueda ser idéntica a forbid
-			 * model.addGreaterOrEqual(nogood, 1);
-			 * }
-			 */
-			/*
-			 * LinearExprBuilder hamDist = LinearExpr.newBuilder();
-			 * for (int a = 0; a < A; a++) {
-			 * if (bestAisles.contains(a)) {
-			 * // 1 - y[a] ≡ -1*y[a] + 1
-			 * hamDist.addTerm(y[a], -1);
-			 * hamDist.add(1); // <-- aquí pones el +1
-			 * } else {
-			 * // y[a]
-			 * hamDist.addTerm(y[a], 1);
-			 * }
-			 * }
-			 * model.addLessOrEqual(hamDist, 3);
-			 */
-			// Pasa un LinearExpr construido a maximize
-			// model.addGreaterOrEqual(objB.build(), 0); // Sacar si no ayuda
 			model.maximize(objB.build());
 
-			// Hints
 			for (int o : ordersSeed)
 				model.addHint(x[o], 1);
 			for (int a : aislesSeed)
@@ -593,16 +621,11 @@ public class ChallengeSolver {
 			CpSolver solver = new CpSolver();
 			int cores = Runtime.getRuntime().availableProcessors();
 			solver.getParameters().setNumSearchWorkers(cores);
-			// solver.getParameters().setSearchBranching(SatParameters.SearchBranching.FIXED_SEARCH);
-			solver.getParameters().setMaxTimeInSeconds(
-					Math.max(1.0, (deadline - System.currentTimeMillis()) / 1000.0));
+			solver.getParameters().setMaxTimeInSeconds(Math.max(1.0, (deadline - System.currentTimeMillis()) / 1000.0));
 			CpSolverStatus status = solver.solve(model);
-			if (status != CpSolverStatus.OPTIMAL && status != CpSolverStatus.FEASIBLE) {
-				System.out.println("[DINK] sin solución en iteración " + it);
+			if (status != CpSolverStatus.OPTIMAL && status != CpSolverStatus.FEASIBLE)
 				break;
-			}
 
-			// Extraer valores
 			double Nval = 0, Dval = 0;
 			Set<Integer> solO = new HashSet<>(), solA = new HashSet<>();
 			for (int o = 0; o < O; o++)
@@ -618,17 +641,13 @@ public class ChallengeSolver {
 
 			double gap = Nval - lambda * Dval;
 			double currRatio = Nval / Dval;
-			System.out.printf(
-					"[DINK] Iter %d: N=%.2f, D=%.2f, gap=%.2e, ratio=%.6f%n",
-					it, Nval, Dval, gap, currRatio);
+			System.out.printf(Locale.US, "[DINK] N=%.2f D=%.2f gap=%.2e ratio=%.6f%n", Nval, Dval, gap, currRatio);
 
 			if (Math.abs(gap) <= tol) {
 				bestRatioLocal = currRatio;
 				bestSol = new ChallengeSolution(solO, solA);
-				System.out.println("[DINK] convergió en iter " + it + " ratio=" + currRatio);
 				break;
 			}
-
 			if (currRatio > bestRatioLocal) {
 				bestRatioLocal = currRatio;
 				bestSol = new ChallengeSolution(solO, solA);
@@ -637,7 +656,6 @@ public class ChallengeSolver {
 			}
 			lambda = currRatio;
 		}
-
 		System.out.println("[DINK] ratio final=" + bestRatioLocal);
 		return bestSol;
 	}
@@ -655,7 +673,20 @@ public class ChallengeSolver {
 		}
 	}
 
-	// Clase para resultados intermedios (ratio, aisles, orders)
+	// ---- GA helper: individuo evaluado ----
+	private static final class Scored {
+		final boolean[] ind;
+		final KResult kr;
+		final double score;
+
+		Scored(boolean[] ind, KResult kr) {
+			this.ind = ind;
+			this.kr = kr;
+			this.score = (kr == null ? Double.NEGATIVE_INFINITY : kr.ratio);
+		}
+	}
+
+	// ---- Resultado knapsack ----
 	static class KResult {
 		public final double ratio;
 		public final Set<Integer> aisles;
